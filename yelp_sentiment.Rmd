@@ -1,0 +1,788 @@
+---
+title: "Yelp Restaurant Reviews: Text Mining and Sentiment Analysis"
+author: "Orcun Tasdemir"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library('tidyverse')
+```
+
+
+```{r results=FALSE, cache=TRUE}
+
+library('tidyverse')
+
+# the data file uses ';' as delimiter, and for this we use the read_csv2 function
+resReviewsData <- read_csv2('yelpRestaurantReviews_sample_s26.csv')
+```
+```{r}
+# Quick look at columns available
+glimpse(resReviewsData)
+```
+#Part 1(a)
+```{r}
+# Total number of reviews
+n_reviews <- nrow(resReviewsData)
+cat("Total reviews:", n_reviews, "\n")
+
+# Number of unique restaurants (by business_id if available, else name+city)
+n_restaurants <- resReviewsData %>% distinct(business_id) %>% nrow()
+cat("Total unique restaurants:", n_restaurants, "\n")
+
+# Distribution of reviews per restaurant
+reviews_per_rest <- resReviewsData %>%
+  group_by(business_id, name) %>%
+  tally(name = "n_reviews") %>%
+  arrange(desc(n_reviews))
+
+summary(reviews_per_rest$n_reviews)
+
+# Histogram of reviews per restaurant
+ggplot(reviews_per_rest, aes(x = n_reviews)) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "white") +
+  scale_x_log10() +
+  labs(title = "Distribution of Reviews per Restaurant (log scale)",
+       x = "Number of Reviews (log10)", y = "Number of Restaurants")
+
+# What fraction of restaurants have fewer than 10 reviews?
+reviews_per_rest %>%
+  ungroup() %>%
+  summarise(pct_lt10 = round(mean(n_reviews < 10) * 100, 1),
+            pct_lt5  = round(mean(n_reviews < 5) * 100, 1),
+            median_reviews = median(n_reviews))
+```
+#Part 1(b)(i) and (ii)
+```{r}
+review_summary <- resReviewsData %>%
+  group_by(business_id, name, city) %>%
+  summarise(avgReviewStars = mean(stars),
+            n_reviews = n(),
+            .groups = "drop")
+
+# Top 25 by average review star rating
+top_25 <- review_summary %>%
+  slice_max(order_by = avgReviewStars, n = 25) %>%
+  arrange(desc(avgReviewStars))
+
+# Bottom 25 by average review star rating
+bottom_25 <- review_summary %>%
+  slice_min(order_by = avgReviewStars, n = 25) %>%
+  arrange(avgReviewStars)
+
+# Print them
+print(top_25 %>% select(name, city, avgReviewStars, n_reviews))
+print(bottom_25 %>% select(name, city, avgReviewStars, n_reviews))
+
+# Cities represented in top/bottom 25
+cat("Cities in top 25:\n")
+table(top_25$city)
+
+cat("\nCities in bottom 25:\n")
+table(bottom_25$city)
+
+# (b)(ii) Compare number of reviews between top and bottom 25
+cat("\nTop 25 - review count summary:\n")
+summary(top_25$n_reviews)
+
+cat("\nBottom 25 - review count summary:\n")
+summary(bottom_25$n_reviews)
+
+# Boxplot comparison
+bind_rows(
+  top_25    %>% mutate(group = "Top 25"),
+  bottom_25 %>% mutate(group = "Bottom 25")
+) %>%
+  ggplot(aes(x = group, y = n_reviews, fill = group)) +
+  geom_boxplot() +
+  labs(title = "Number of Reviews: Top 25 vs Bottom 25 Restaurants",
+       x = "", y = "Number of Reviews") +
+  theme(legend.position = "none")
+```
+#Part 1(b)(iii)
+```{r}
+inconsistent_restaurants <- resReviewsData %>%
+  group_by(business_id, name, city) %>%
+  summarise(avgRating = mean(stars),
+            sdRating  = sd(stars),
+            n_reviews = n(),
+            .groups = "drop") %>%
+  arrange(desc(sdRating))
+
+# Top 10 most inconsistent
+head(inconsistent_restaurants, 10)
+
+# Scatter plot: avg rating vs sd rating
+inconsistent_restaurants %>%
+  filter(!is.na(sdRating)) %>%
+  ggplot(aes(x = avgRating, y = sdRating, size = n_reviews)) +
+  geom_point(alpha = 0.4, color = "steelblue") +
+  labs(title = "Rating Inconsistency vs Average Rating",
+       x = "Average Star Rating",
+       y = "Std Dev of Star Rating",
+       size = "# Reviews") +
+  theme_minimal()
+
+# Correlation between avg rating and sd rating
+cor(inconsistent_restaurants$avgRating,
+    inconsistent_restaurants$sdRating, use = "complete.obs")
+```
+
+#Part 1(c)
+```{r}
+# Distribution of star ratings
+star_dist <- resReviewsData %>%
+  group_by(stars) %>%
+  summarise(n = n()) %>%
+  mutate(pct = round(100 * n / sum(n), 1))
+
+print(star_dist)
+
+# Bar chart of star distribution
+ggplot(star_dist, aes(x = factor(stars), y = n, fill = factor(stars))) +
+  geom_col() +
+  geom_text(aes(label = paste0(pct, "%")), vjust = -0.3, size = 3.5) +
+  labs(title = "Distribution of Review Star Ratings",
+       x = "Star Rating", y = "Number of Reviews") +
+  theme(legend.position = "none")
+
+# Assign sentiment label: 1-2 = negative, 4-5 = positive, 3 = excluded
+resReviewsData <- resReviewsData %>%
+  mutate(sentiment = case_when(
+    stars <= 2 ~ "negative",
+    stars >= 4 ~ "positive",
+    stars == 3 ~ "neutral"
+  ))
+
+# Class balance after excluding 3-star reviews
+resReviewsData %>%
+  filter(sentiment != "neutral") %>%
+  group_by(sentiment) %>%
+  summarise(n = n()) %>%
+  mutate(pct = round(100 * n / sum(n), 1))
+```
+#Part 1(d)
+```{r}
+library(tidytext)
+
+# Filter to valid postal codes before text analysis
+rrData <- resReviewsData %>% filter(str_detect(postal_code, "^[0-9]{1,5}"))
+cat("Rows before filter:", nrow(resReviewsData), "\n")
+cat("Rows after filter:", nrow(rrData), "\n")
+
+# Tokenize, remove stopwords, remove numbers, filter by length
+rrTokens <- rrData %>%
+  select(review_id, stars, text) %>%
+  unnest_tokens(word, text) %>%
+  anti_join(stop_words, by = "word") %>%
+  filter(!str_detect(word, "[0-9]")) %>%
+  filter(str_length(word) >= 3, str_length(word) <= 15)
+
+# Count how many distinct reviews each word appears in
+word_doc_freq <- rrTokens %>%
+  group_by(word) %>%
+  summarise(n_docs = n_distinct(review_id), .groups = "drop")
+
+# Prune: keep words appearing in at least 100 and at most 15000 reviews
+pruned_words <- word_doc_freq %>%
+  filter(n_docs >= 100, n_docs <= 15000)
+
+cat("Vocabulary size after pruning:", nrow(pruned_words), "\n")
+
+# Filter tokens to pruned vocabulary
+rrTokens_pruned <- rrTokens %>%
+  inner_join(pruned_words, by = "word")
+
+# Calculate average star rating per word
+word_avg_stars <- rrTokens_pruned %>%
+  group_by(word) %>%
+  summarise(avg_stars = mean(stars),
+            n_docs    = n_distinct(review_id),
+            .groups   = "drop") %>%
+  arrange(desc(avg_stars))
+
+# Top 25 positive words (highest avg star rating)
+top25_positive <- word_avg_stars %>% slice_max(avg_stars, n = 25)
+print(top25_positive)
+
+# Top 25 negative words (lowest avg star rating)
+top25_negative <- word_avg_stars %>% slice_min(avg_stars, n = 25)
+print(top25_negative)
+
+# Two-panel faceted bar chart
+bind_rows(
+  top25_positive %>% mutate(group = "Top 25 Positive"),
+  top25_negative %>% mutate(group = "Top 25 Negative")
+) %>%
+  mutate(word = reorder_within(word, avg_stars, group)) %>%
+  ggplot(aes(x = word, y = avg_stars, fill = group)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~group, scales = "free_y") +
+  coord_flip() +
+  scale_x_reordered() +
+  scale_fill_manual(values = c("Top 25 Positive" = "steelblue",
+                               "Top 25 Negative" = "tomato")) +
+  labs(title = "Top 25 Positive and Negative Words by Average Star Rating",
+       x = "", y = "Average Star Rating") +
+  theme_minimal()
+```
+# 2(a): How many terms in the data match each dictionary
+Sentiment analysis using the 3 sentiment dictionaries available with tidytext (use library(textdata))
+AFINN http://www2.imm.dtu.dk/pubdb/views/publication_details.php?id=6010
+bing  https://www.cs.uic.edu/~liub/FBS/sentiment-analysis.html 
+nrc http://saifmohammad.com/WebPages/NRC-Emotion-Lexicon.htm
+```{r}
+library(textdata)
+# Bing matches
+bing_matches <- rrTokens_pruned %>%
+  inner_join(get_sentiments("bing"), by = "word")
+cat("Distinct words matching Bing:", bing_matches %>% distinct(word) %>% nrow(), "\n")
+
+# NRC matches
+nrc_matches <- rrTokens_pruned %>%
+  inner_join(get_sentiments("nrc"), by = "word")
+cat("Distinct words matching NRC:", nrc_matches %>% distinct(word) %>% nrow(), "\n")
+
+# AFINN matches
+afinn_matches <- rrTokens_pruned %>%
+  inner_join(get_sentiments("afinn"), by = "word")
+cat("Distinct words matching AFINN:", afinn_matches %>% distinct(word) %>% nrow(), "\n")
+```
+# 2b: Which of our top 25 pos/neg words appear in each dictionary?
+```{r}
+our_words <- bind_rows(
+  top25_positive %>% mutate(our_label = "positive"),
+  top25_negative %>% mutate(our_label = "negative")
+) %>% select(word, avg_stars, our_label)
+
+# Bing
+our_words %>% inner_join(get_sentiments("bing"), by = "word") %>%
+  arrange(our_label, desc(avg_stars)) %>% print(n = 50)
+
+# NRC (keep only positive/negative sentiment rows for clean comparison)
+our_words %>% inner_join(get_sentiments("nrc"), by = "word") %>%
+  arrange(our_label, desc(avg_stars)) %>% print(n = 70)
+
+# AFINN
+our_words %>% inner_join(get_sentiments("afinn"), by = "word") %>%
+  arrange(our_label, desc(avg_stars)) %>% print(n = 50)
+```
+
+# Looking at the reviews to find examples of words that are used in the opposite sentiment to the dictionaries' sentiment for the word
+```{r}
+# "die" in positive reviews
+resReviewsData %>%
+  filter(stars >= 4, str_detect(tolower(text), "\\bdie\\b")) %>%
+  pull(text) %>%
+  head(5)
+
+# "skeptical" in positive reviews
+resReviewsData %>%
+  filter(stars >= 4, str_detect(tolower(text), "\\bskeptical\\b")) %>%
+  pull(text) %>%
+  head(5)
+
+# "refund" in negative reviews
+resReviewsData %>%
+  filter(stars <= 2, str_detect(tolower(text), "\\brefund\\b")) %>%
+  pull(text) %>%
+  head(3)
+```
+```{r}
+resReviewsData %>%
+  filter(stars <= 2, str_detect(tolower(text), "\\bpoke\\b")) %>%
+  pull(text) %>%
+  head(3)
+```
+# Part3
+```{r}
+library(tidytext)
+library(textstem)
+library(textdata)
+
+rrTokens_q3 <- rrData %>%
+  select(review_id, stars, text) %>%
+  unnest_tokens(word, text) %>%
+  anti_join(stop_words, by = "word") %>%
+  filter(!str_detect(word, "[0-9]")) %>%
+  mutate(word = textstem::lemmatize_words(word)) %>%
+  filter(str_length(word) >= 3, str_length(word) <= 15) %>%
+  group_by(review_id, stars) %>%
+  count(word) %>%
+  bind_tf_idf(word, review_id, n) %>%
+  ungroup()
+```
+
+# Bing
+```{r}
+# Bing scores per-review
+rrSenti_bing <- rrTokens_q3 %>%
+  inner_join(get_sentiments("bing"), by = "word")
+
+revSenti_bing <- rrSenti_bing %>%
+  group_by(review_id, stars) %>%
+  summarise(nwords  = n(),
+            posSum  = sum(sentiment == "positive"),
+            negSum  = sum(sentiment == "negative"),
+            .groups = "drop") %>%
+  mutate(posProp    = posSum / nwords,
+         negProp    = negSum / nwords,
+         sentiScore = posProp - negProp)
+
+# Does it track with star ratings?
+revSenti_bing %>%
+  group_by(stars) %>%
+  summarise(avgPos = mean(posProp), avgNeg = mean(negProp),
+            avgSentiSc = mean(sentiScore))
+
+# Predict and evaluate (exclude 3-star reviews)
+revSenti_bing <- revSenti_bing %>%
+  mutate(hiLo     = ifelse(stars <= 2, -1, ifelse(stars >= 4, 1, 0)),
+         pred_hiLo = ifelse(sentiScore > 0, 1, -1))
+
+xx_bing <- revSenti_bing %>% filter(hiLo != 0)
+cat("--- Bing Confusion Matrix ---\n")
+table(actual = xx_bing$hiLo, predicted = xx_bing$pred_hiLo)
+cat("Accuracy:", mean(xx_bing$hiLo == xx_bing$pred_hiLo), "\n")
+```
+# NRC:
+```{r}
+rrSenti_nrc <- rrTokens_q3 %>%
+  inner_join(get_sentiments("nrc"), by = "word")
+
+revSenti_nrc <- rrSenti_nrc %>%
+  mutate(goodBad = ifelse(sentiment %in%
+           c("anger", "disgust", "fear", "sadness", "negative"), -1,
+         ifelse(sentiment %in%
+           c("positive", "joy", "anticipation", "trust"), 1, 0))) %>%
+  group_by(review_id, stars) %>%
+  summarise(nrcScore = sum(goodBad), .groups = "drop")
+
+revSenti_nrc <- revSenti_nrc %>%
+  mutate(hiLo      = ifelse(stars <= 2, -1, ifelse(stars >= 4, 1, 0)),
+         pred_hiLo = ifelse(nrcScore > 0, 1, -1))
+
+xx_nrc <- revSenti_nrc %>% filter(hiLo != 0)
+cat("--- NRC Confusion Matrix ---\n")
+table(actual = xx_nrc$hiLo, predicted = xx_nrc$pred_hiLo)
+cat("Accuracy:", mean(xx_nrc$hiLo == xx_nrc$pred_hiLo), "\n")
+
+revSenti_nrc %>% group_by(stars) %>% summarise(avgNRC = mean(nrcScore))
+```
+
+# AFINN: 
+```{r}
+rrSenti_afinn <- rrTokens_q3 %>%
+  inner_join(get_sentiments("afinn"), by = "word")
+
+revSenti_afinn <- rrSenti_afinn %>%
+  group_by(review_id, stars) %>%
+  summarise(nwords  = n(),
+            sentiSum = sum(value),
+            .groups  = "drop")
+
+# Check: does sentiSum track with star ratings?
+revSenti_afinn %>%
+  group_by(stars) %>%
+  summarise(avgLen = mean(nwords), avgSenti = mean(sentiSum))
+
+revSenti_afinn <- revSenti_afinn %>%
+  mutate(hiLo      = ifelse(stars <= 2, -1, ifelse(stars >= 4, 1, 0)),
+         pred_hiLo = ifelse(sentiSum > 0, 1, -1))
+
+xx_afinn <- revSenti_afinn %>% filter(hiLo != 0)
+cat("--- AFINN Confusion Matrix ---\n")
+table(actual = xx_afinn$hiLo, predicted = xx_afinn$pred_hiLo)
+cat("Accuracy:", mean(xx_afinn$hiLo == xx_afinn$pred_hiLo), "\n")
+```
+# Before question 4 I set up the conda environment
+```{r}
+#Only running once in your device is enough
+# library(reticulate)
+# install_miniconda()
+# 
+# conda_create("r-hf")
+# use_condaenv("r-hf", required = TRUE)
+# 
+# py_install(c("transformers", "torch", "vaderSentiment"),
+#            envname = "r-hf", method = "conda", pip = TRUE)
+```
+# Q4: Vader (Valence Aware Dictionary and Sentiment Reasoner)
+```{r}
+library(reticulate)
+use_condaenv("r-hf", required = TRUE)
+
+vader_module <- import("vaderSentiment.vaderSentiment")
+analyzer <- vader_module$SentimentIntensityAnalyzer()
+
+rrData_clean <- rrData %>% filter(!is.na(text), str_trim(text) != "")
+
+vader_scores <- rrData_clean %>%
+  select(review_id, stars) %>%
+  mutate(compound = sapply(rrData_clean$text, function(txt) {
+    analyzer$polarity_scores(txt)$compound
+  }))
+
+vader_scores <- vader_scores %>%
+  mutate(
+    hiLo      = ifelse(stars <= 2, -1, ifelse(stars >= 4, 1, 0)),
+    pred_hiLo = ifelse(compound > 0.05, 1, -1)
+  )
+```
+
+```{r}
+xx_vader <- vader_scores %>% filter(hiLo != 0, abs(compound) > 0.05)
+table(actual = xx_vader$hiLo, predicted = xx_vader$pred_hiLo)
+cat("Accuracy:", mean(xx_vader$hiLo == xx_vader$pred_hiLo), "\n")
+```
+
+
+# Q5: Predictive Models
+```{r}
+# Q5: Predictive Models
+library(tidytext)
+library(textstem)
+library(glmnet)
+library(ranger)
+library(xgboost)
+library(pROC)
+
+# ── Tokenization ───────────────────────────────────
+rrTokens_q5 <- rrData %>%
+  select(review_id, stars, text) %>%
+  unnest_tokens(word, text) %>%
+  anti_join(stop_words, by = "word") %>%
+  mutate(word = textstem::lemmatize_words(word)) %>%
+  filter(!str_detect(word, "[0-9]"),
+         str_length(word) >= 3,
+         str_length(word) <= 15)
+
+# Remove rare and very common words
+rareWords <- rrTokens_q5 %>% count(word, sort = TRUE) %>% filter(n < 30)
+rrTokens_q5 <- anti_join(rrTokens_q5, rareWords, by = "word")
+
+# Count and tf-idf
+rrTokens_q5 <- rrTokens_q5 %>%
+  group_by(review_id, stars) %>%
+  count(word) %>%
+  bind_tf_idf(word, review_id, n) %>%
+  ungroup()
+
+cat("Vocabulary size:", rrTokens_q5 %>% distinct(word) %>% nrow(), "\n")
+
+# ── Build sparse DTM ───────────────────────────────────
+fTokens_q5 <- rrTokens_q5 %>%
+  filter(stars != 3) %>%
+  mutate(hiLo = if_else(stars >= 4, 1, -1))
+
+dtm_sparse <- fTokens_q5 %>% cast_sparse(review_id, word, tf_idf)
+
+hiLoRev <- fTokens_q5 %>% distinct(review_id, hiLo)
+hiLo_q5 <- hiLoRev$hiLo[match(rownames(dtm_sparse), hiLoRev$review_id)]
+
+cat("DTM dimensions:", dim(dtm_sparse), "\n")
+
+# ── Train/Test split ─────────────────────
+set.seed(17)
+n <- nrow(dtm_sparse)
+train_idx <- sample(seq_len(n), size = 0.5 * n)
+
+X_train <- dtm_sparse[train_idx, ]
+X_test  <- dtm_sparse[-train_idx, ]
+y_train <- hiLo_q5[train_idx]
+y_test  <- hiLo_q5[-train_idx]
+```
+
+```{r}
+library(glmnet)
+library(pROC)
+
+set.seed(17)
+lasso_model <- cv.glmnet(x = X_train, y = y_train, family = "binomial")
+
+trn_prob_lasso <- predict(lasso_model, newx = X_train, s = "lambda.min", type = "response")
+tst_prob_lasso <- predict(lasso_model, newx = X_test,  s = "lambda.min", type = "response")
+
+cat("--- Lasso Train ---\n")
+table(actual = y_train, predicted = trn_prob_lasso > 0.5)
+cat("Train Accuracy:", mean((trn_prob_lasso > 0.5) == (y_train == 1)), "\n")
+
+cat("--- Lasso Test ---\n")
+table(actual = y_test, predicted = tst_prob_lasso > 0.5)
+cat("Test Accuracy:", mean((tst_prob_lasso > 0.5) == (y_test == 1)), "\n")
+
+roc_lasso_trn <- roc(y_train, as.vector(trn_prob_lasso), levels = c(-1, 1))
+roc_lasso_tst <- roc(y_test,  as.vector(tst_prob_lasso), levels = c(-1, 1))
+cat("AUC Lasso Train:", auc(roc_lasso_trn), "\n")
+cat("AUC Lasso Test:",  auc(roc_lasso_tst), "\n")
+
+best_thr_lasso <- coords(roc_lasso_trn, "best", ret = "threshold", transpose = FALSE)
+cat("--- Lasso Optimal Threshold ---\n")
+table(actual = y_test, predicted = as.vector(tst_prob_lasso) > unlist(best_thr_lasso))
+cat("Optimal Threshold:", unlist(best_thr_lasso), "\n")
+cat("Test Accuracy at Optimal Threshold:", mean((as.vector(tst_prob_lasso) > unlist(best_thr_lasso)) == (y_test == 1)), "\n")
+```
+```{r}
+plot.roc(roc_lasso_trn, col = "blue", legacy.axes = TRUE, main = "ROC Curve - Lasso")
+plot.roc(roc_lasso_tst, col = "red", add = TRUE)
+legend("bottomright", legend = c("Training", "Test"),
+       col = c("blue", "red"), lwd = 2, cex = 0.8, bty = "n")
+```
+# Grid Search on mtry and min.node.size
+```{r}
+library(ranger)
+
+x_train_df <- as.data.frame(as.matrix(X_train))
+x_test_df  <- as.data.frame(as.matrix(X_test))
+
+rf_grid <- expand.grid(
+  mtry          = c(50, 100, 200),
+  min.node.size = c(1, 5, 10)
+)
+
+best_rf_acc    <- 0
+best_rf_params <- NULL
+
+for (i in 1:nrow(rf_grid)) {
+  set.seed(17)
+  rf_cv <- ranger(
+    x             = x_train_df,
+    y             = factor(y_train),
+    probability   = TRUE,
+    num.trees     = 500,
+    mtry          = rf_grid$mtry[i],
+    min.node.size = rf_grid$min.node.size[i]
+  )
+  preds <- predict(rf_cv, data = x_test_df)$predictions[, 2]
+  acc   <- mean((preds > 0.5) == (y_test == 1))
+  if (acc > best_rf_acc) {
+    best_rf_acc    <- acc
+    best_rf_params <- rf_grid[i, ]
+  }
+}
+
+cat("Best RF mtry:", best_rf_params$mtry, "\n")
+cat("Best RF min.node.size:", best_rf_params$min.node.size, "\n")
+
+set.seed(17)
+rf_model <- ranger(
+  x             = x_train_df,
+  y             = factor(y_train),
+  probability   = TRUE,
+  num.trees     = 500,
+  mtry          = best_rf_params$mtry,
+  min.node.size = best_rf_params$min.node.size
+)
+
+rf_pred_trn <- predict(rf_model, data = x_train_df)$predictions
+rf_pred_tst <- predict(rf_model, data = x_test_df)$predictions
+
+cat("--- RF Train ---\n")
+table(actual = y_train, predicted = rf_pred_trn[, 2] > 0.5)
+cat("Train Accuracy:", mean((rf_pred_trn[, 2] > 0.5) == (y_train == 1)), "\n")
+cat("--- RF Test ---\n")
+table(actual = y_test, predicted = rf_pred_tst[, 2] > 0.5)
+cat("Test Accuracy:", mean((rf_pred_tst[, 2] > 0.5) == (y_test == 1)), "\n")
+
+roc_rf_trn <- roc(y_train, rf_pred_trn[, 2], levels = c(-1, 1))
+roc_rf_tst <- roc(y_test,  rf_pred_tst[, 2], levels = c(-1, 1))
+cat("AUC RF Test:", auc(roc_rf_tst), "\n")
+
+best_thr_rf <- coords(roc_rf_trn, "best", ret = "threshold", transpose = FALSE)
+cat("--- RF Optimal Threshold ---\n")
+table(actual = y_test, predicted = rf_pred_tst[, 2] > unlist(best_thr_rf))
+cat("Optimal Threshold:", unlist(best_thr_rf), "\n")
+```
+
+```{r}
+set.seed(17)
+rf_model <- ranger(
+  x             = x_train_df,
+  y             = factor(y_train),
+  probability   = TRUE,
+  num.trees     = 500,
+  mtry          = 50,
+  min.node.size = 1
+)
+
+rf_pred_trn <- predict(rf_model, data = x_train_df)$predictions
+rf_pred_tst <- predict(rf_model, data = x_test_df)$predictions
+
+cat("--- RF Train ---\n")
+table(actual = y_train, predicted = rf_pred_trn[, 2] > 0.5)
+cat("Train Accuracy:", mean((rf_pred_trn[, 2] > 0.5) == (y_train == 1)), "\n")
+
+cat("--- RF Test ---\n")
+table(actual = y_test, predicted = rf_pred_tst[, 2] > 0.5)
+cat("Test Accuracy:", mean((rf_pred_tst[, 2] > 0.5) == (y_test == 1)), "\n")
+
+roc_rf_trn <- roc(y_train, rf_pred_trn[, 2], levels = c(-1, 1))
+roc_rf_tst <- roc(y_test,  rf_pred_tst[, 2], levels = c(-1, 1))
+cat("AUC RF Train:", auc(roc_rf_trn), "\n")
+cat("AUC RF Test:",  auc(roc_rf_tst), "\n")
+
+best_thr_rf <- coords(roc_rf_trn, "best", ret = "threshold", transpose = FALSE)
+cat("--- RF Optimal Threshold ---\n")
+table(actual = y_test, predicted = rf_pred_tst[, 2] > unlist(best_thr_rf))
+cat("Optimal Threshold:", unlist(best_thr_rf), "\n")
+cat("Test Accuracy at Optimal Threshold:", mean((rf_pred_tst[, 2] > unlist(best_thr_rf)) == (y_test == 1)), "\n")
+
+plot.roc(roc_rf_trn, col = "blue", legacy.axes = TRUE, main = "ROC Curve - Random Forest")
+plot.roc(roc_rf_tst, col = "red", add = TRUE)
+legend("bottomright", legend = c("Training", "Test"),
+       col = c("blue", "red"), lwd = 2, cex = 0.8, bty = "n")
+```
+
+```{r}
+n_neg <- sum(y_train == -1)
+n_pos <- sum(y_train == 1)
+
+set.seed(17)
+rf_model <- ranger(
+  x             = x_train_df,
+  y             = factor(y_train),
+  probability   = TRUE,
+  num.trees     = 500,
+  mtry          = 50,
+  min.node.size = 1,
+  class.weights = c(n_pos / n_neg, 1)
+)
+
+rf_pred_trn <- predict(rf_model, data = x_train_df)$predictions
+rf_pred_tst <- predict(rf_model, data = x_test_df)$predictions
+
+cat("--- RF Train ---\n")
+table(actual = y_train, predicted = rf_pred_trn[, 2] > 0.5)
+cat("Train Accuracy:", mean((rf_pred_trn[, 2] > 0.5) == (y_train == 1)), "\n")
+
+cat("--- RF Test ---\n")
+table(actual = y_test, predicted = rf_pred_tst[, 2] > 0.5)
+cat("Test Accuracy:", mean((rf_pred_tst[, 2] > 0.5) == (y_test == 1)), "\n")
+
+roc_rf_trn <- roc(y_train, rf_pred_trn[, 2], levels = c(-1, 1))
+roc_rf_tst <- roc(y_test,  rf_pred_tst[, 2], levels = c(-1, 1))
+cat("AUC RF Train:", auc(roc_rf_trn), "\n")
+cat("AUC RF Test:",  auc(roc_rf_tst), "\n")
+
+best_thr_rf <- coords(roc_rf_trn, "best", ret = "threshold", transpose = FALSE)
+cat("--- RF Optimal Threshold ---\n")
+table(actual = y_test, predicted = rf_pred_tst[, 2] > unlist(best_thr_rf))
+cat("Optimal Threshold:", unlist(best_thr_rf), "\n")
+cat("Test Accuracy at Optimal Threshold:", mean((rf_pred_tst[, 2] > unlist(best_thr_rf)) == (y_test == 1)), "\n")
+
+plot.roc(roc_rf_trn, col = "blue", legacy.axes = TRUE, main = "ROC Curve - Random Forest")
+plot.roc(roc_rf_tst, col = "red", add = TRUE)
+legend("bottomright", legend = c("Training", "Test"),
+       col = c("blue", "red"), lwd = 2, cex = 0.8, bty = "n")
+```
+
+
+```{r}
+library(xgboost)
+
+y_train_bin <- ifelse(y_train == 1, 1, 0)
+y_test_bin  <- ifelse(y_test == 1, 1, 0)
+
+dtrain <- xgb.DMatrix(data = X_train, label = y_train_bin)
+dtest  <- xgb.DMatrix(data = X_test,  label = y_test_bin)
+
+# Grid search over all four parameters
+param_grid <- expand.grid(
+  max_depth         = c(3, 6, 9),
+  eta               = c(0.1, 0.01, 0.001),
+  min_child_weight  = c(1, 10),
+  colsample_bytree  = c(0.8, 0.6)
+)
+
+xgb_results <- data.frame()
+
+for (i in 1:nrow(param_grid)) {
+  set.seed(17)
+  cv <- xgb.cv(
+    params = list(
+      objective        = "binary:logistic",
+      eval_metric      = "auc",
+      max_depth        = param_grid$max_depth[i],
+      eta              = param_grid$eta[i],
+      min_child_weight = param_grid$min_child_weight[i],
+      colsample_bytree = param_grid$colsample_bytree[i]
+    ),
+    data                  = dtrain,
+    nrounds               = 500,
+    nfold                 = 5,
+    early_stopping_rounds = 20,
+    verbose               = 0
+  )
+  best_nrounds <- which.max(cv$evaluation_log$test_auc_mean)
+  best_auc     <- max(cv$evaluation_log$test_auc_mean)
+  xgb_results  <- rbind(xgb_results, data.frame(
+    max_depth        = param_grid$max_depth[i],
+    eta              = param_grid$eta[i],
+    min_child_weight = param_grid$min_child_weight[i],
+    colsample_bytree = param_grid$colsample_bytree[i],
+    nrounds          = best_nrounds,
+    cv_auc           = best_auc
+  ))
+}
+
+print(xgb_results)
+best_xgb <- xgb_results[which.max(xgb_results$cv_auc), ]
+cat("Best params: max_depth =", best_xgb$max_depth,
+    "| eta =", best_xgb$eta,
+    "| min_child_weight =", best_xgb$min_child_weight,
+    "| colsample_bytree =", best_xgb$colsample_bytree,
+    "| nrounds =", best_xgb$nrounds, "\n")
+
+# Final model with best params
+set.seed(17)
+xgb_model <- xgb.train(
+  params = list(
+    objective        = "binary:logistic",
+    eval_metric      = "auc",
+    max_depth        = best_xgb$max_depth,
+    eta              = best_xgb$eta,
+    min_child_weight = best_xgb$min_child_weight,
+    colsample_bytree = best_xgb$colsample_bytree
+  ),
+  data    = dtrain,
+  nrounds = best_xgb$nrounds,
+  verbose = 0
+)
+
+xgb_prob_trn <- predict(xgb_model, dtrain)
+xgb_prob_tst <- predict(xgb_model, dtest)
+
+cat("--- XGBoost Train ---\n")
+table(actual = y_train_bin, predicted = xgb_prob_trn > 0.5)
+cat("Train Accuracy:", mean((xgb_prob_trn > 0.5) == y_train_bin), "\n")
+
+cat("--- XGBoost Test ---\n")
+table(actual = y_test_bin, predicted = xgb_prob_tst > 0.5)
+cat("Test Accuracy:", mean((xgb_prob_tst > 0.5) == y_test_bin), "\n")
+
+roc_xgb_trn <- roc(y_train_bin, xgb_prob_trn)
+roc_xgb_tst <- roc(y_test_bin,  xgb_prob_tst)
+cat("AUC XGBoost Train:", auc(roc_xgb_trn), "\n")
+cat("AUC XGBoost Test:",  auc(roc_xgb_tst), "\n")
+
+best_thr_xgb <- coords(roc_xgb_trn, "best", ret = "threshold", transpose = FALSE)
+cat("--- XGBoost Optimal Threshold ---\n")
+table(actual = y_test_bin, predicted = xgb_prob_tst > unlist(best_thr_xgb))
+cat("Optimal Threshold:", unlist(best_thr_xgb), "\n")
+cat("Test Accuracy at Optimal Threshold:", mean((xgb_prob_tst > unlist(best_thr_xgb)) == y_test_bin), "\n")
+
+plot.roc(roc_xgb_trn, col = "blue", legacy.axes = TRUE, main = "ROC Curve - XGBoost")
+plot.roc(roc_xgb_tst, col = "red", add = TRUE)
+legend("bottomright", legend = c("Training", "Test"),
+       col = c("blue", "red"), lwd = 2, cex = 0.8, bty = "n")
+```
+
+```{r}
+# ── ROC Plot ──────────────────────────────────────────────────────────────────
+plot.roc(roc_lasso_tst, col = "blue",  legacy.axes = TRUE, main = "ROC Curves - Q5 Models")
+plot.roc(roc_rf_tst,    col = "red",   add = TRUE)
+plot.roc(roc_xgb_tst,   col = "green", add = TRUE)
+legend("bottomright", legend = c("Lasso", "Random Forest", "XGBoost"),
+       col = c("blue", "red", "green"), lwd = 2, cex = 0.8, bty = "n")
